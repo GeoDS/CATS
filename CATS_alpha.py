@@ -11,6 +11,8 @@ import torch.optim as optim
 import numpy as np
 from datetime import datetime
 
+import ot
+
 from torchmetrics.functional import pairwise_cosine_similarity
 
 import glob
@@ -46,7 +48,6 @@ class logger(object):
     def close(self):
         self.loss_log.close()
         self.info_log.close()
-        
 
 
 class STMMDataset(Dataset):
@@ -71,7 +72,8 @@ class STMMDataset(Dataset):
         sampled_points = np.concatenate([self.sample_index(p.copy() / p.copy().sum()) for p in img])
         sampled_points = rearrange(sampled_points, '(n s) l -> n s l', s = self.sample_size)
         
-        return sampled_points / 127.0, real_points / 127.0
+        return sampled_points / 127.0, real_points / 127.0, img
+    
 
 
 class BipartiteGraphMatcher(nn.Module):
@@ -116,13 +118,13 @@ class BipartiteGraphMatcher(nn.Module):
     def forward(self, cost_matrix):
         scores = self.log_optimal_transport(
             cost_matrix, self.bin_score,
-            iters=10000)
+            iters=100)
         return scores
 
     
 # Trajectory Generator
 class TrajGenerator(nn.Module):
-    def __init__(self, num_traj=128, dim_loc=2, dim_embed=32, num_head=8, drop_out_rate=0.5):
+    def __init__(self, num_traj=128, dim_loc=2, dim_embed=32, num_head=8, drop_out_rate=0.2):
         super(TrajGenerator, self).__init__()
         
         self.num_traj = num_traj
@@ -134,32 +136,28 @@ class TrajGenerator(nn.Module):
         # location embedding (2 -> 32)
         self.location_embedding = nn.Sequential(
             nn.Linear(self.dim_loc, self.dim_embed),
-            nn.LeakyReLU(0.2)
+            nn.ReLU()
             )
         
         # time embedding (24 -> 32)
         self.time_embedding = nn.Sequential(
             nn.Embedding(24, self.dim_embed),
-            nn.LeakyReLU(0.2)
+            nn.ReLU()
             )
         
-#         # spatio-temporal fusion (64 -> 64)
-#         self.fusion_layer = nn.Sequential(
-#             nn.Linear(self.dim_embed * 2, self.dim_embed * 2),
-#             nn.LeakyReLU(0.2)
-#             )
+        self.batch_norm = nn.BatchNorm1d(self.dim_embed * 2)
         
         # global spatial context attention
         self.global_sc_attn = nn.MultiheadAttention(self.dim_embed * 2, self.num_head)
         self.layer_norm = nn.LayerNorm(self.dim_embed * 2)
-        self.drop_out = nn.Dropout(self.drop_out_rate)
+#         self.drop_out = nn.Dropout(self.drop_out_rate)
         
         # trajectory modeling
         self.traj_mod_gru = nn.GRUCell(self.dim_embed * 2, self.dim_embed * 2)
         self.tanh = nn.Tanh()
         
-        # bipartite graph matching
-#         self.bipartite_graph_matcher = BipartiteGraphMatcher()
+        # differentiable bipartite graph matching (if using neural distance)
+        # self.bipartite_graph_matcher = BipartiteGraphMatcher()
 
     def forward(self, x):
         # location embedding
@@ -170,13 +168,13 @@ class TrajGenerator(nn.Module):
         
         # spatio-temporal concatenation
         embed_p = torch.cat([embed_x[0], embed_t], dim = 1)
-
-        # spatio-temporal fusion
-#         embed_p = self.fusion_layer(embed_p)
+        
+        # batch normalization
+        embed_p = self.batch_norm(embed_p)
 
         # global spatial context attention for current-step trajectory points
         curr_attn_output, _ = self.global_sc_attn(embed_p, embed_p, embed_p)
-        # curr_attn_output = self.drop_out(curr_attn_output)
+#         curr_attn_output = self.drop_out(curr_attn_output)
         curr_state = self.layer_norm(embed_p + curr_attn_output)
         # normalize the value range to (-1, 1)
         curr_state = self.tanh(curr_state)
@@ -200,8 +198,8 @@ class TrajGenerator(nn.Module):
             # spatio-temporal concatenation
             next_embed_p = torch.cat([next_embed_p, next_embed_t], dim = 1)
             
-            # spatio-temporal fusion
-#             next_embed_p = self.fusion_layer(next_embed_p)
+            # batch normalization
+            next_embed_p = self.batch_norm(next_embed_p)
             
             # global spatial context attention for next-step trajectory points
             next_attn_output, _ = self.global_sc_attn(next_embed_p, next_embed_p, next_embed_p)
@@ -215,31 +213,10 @@ class TrajGenerator(nn.Module):
             
             # cost matrix based on L2 cost
             cost_matrix = torch.cdist(next_state_pred, next_state, p=2)
-            # cost_matrix = 1.00001 - pairwise_cosine_similarity(next_state_pred, next_state)
-            
-#             # bipartite graph matching between the next state prediction and next state ground truth
-#             matching_res = self.bipartite_graph_matcher(cost_matrix.unsqueeze(0).log_softmax(dim=-2))
-            
-#             # Get the successful matches
-#             max0, max1 = matching_res[:, :-1, :-1].max(2), matching_res[:, :-1, :-1].max(1)
-#             indices0, indices1 = max0.indices, max1.indices
-#             mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
-#             mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
-#             zero = scores.new_tensor(0)
-#             mscores0 = torch.where(mutual0, max0.values.exp(), zero)
-#             mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
-#             valid0 = mutual0 & (mscores0 > 0.)
-#             valid1 = mutual1 & valid0.gather(1, indices1)
-#             indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
-#             indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
 
             # bipartite graph matching between the next state prediction and next state ground truth
             with torch.no_grad():
                 next_state_index = torch.as_tensor(linear_sum_assignment(cost_matrix.cpu())[1])
-            
-            # with torch.no_grad():
-                # cosine_cost = cosine_cost - nn.functional.cosine_similarity(hx, next_state) + 1
-                # cosine_cost = cosine_cost + nn.functional.pairwise_distance(hx, next_state, p=2)
                 
             matching_cost = matching_cost + nn.functional.pairwise_distance(next_state_pred, next_state[next_state_index], p=2)
             
@@ -251,44 +228,51 @@ class TrajGenerator(nn.Module):
         avg_matching_cost = matching_cost.mean() / x.shape[0]
 
         return rearrange(torch.dstack(gen_traj_list), 'n p t -> n t p'), avg_matching_cost
-    
 
 class TrajDiscriminator(nn.Module):
-    def __init__(self, num_traj=128, dim_loc=2, dim_embed=32):
+    def __init__(self, num_traj=128, dim_loc=2, dim_embed=32, num_head=8, drop_out_rate=0.2):
         super(TrajDiscriminator, self).__init__()
         
         self.num_traj = num_traj
         self.dim_loc = dim_loc
         self.dim_embed = dim_embed
+        self.num_head = num_head
+        self.drop_out_rate = drop_out_rate
         
         # location embedding (2 -> 32)
         self.location_embedding = nn.Sequential(
             nn.Linear(self.dim_loc, self.dim_embed),
-            nn.LeakyReLU(0.2)
+            nn.ReLU()
             )
         
         # time embedding (24 -> 32)
         self.time_embedding = nn.Sequential(
             nn.Embedding(24, self.dim_embed),
-            nn.LeakyReLU(0.2)
+            nn.ReLU()
             )
         
-#         # spatio-temporal fusion (64 -> 64)
-#         self.fusion_layer = nn.Sequential(
-#             nn.Linear(self.dim_embed * 2, self.dim_embed * 2),
-#             nn.LeakyReLU(0.2)
-#             )
+        self.batch_norm = nn.BatchNorm1d(self.dim_embed * 2)
+        
+        self.condition_embedding = resnet_mini()
+        self.tanh = nn.Tanh()
+
+        # global spatial context attention
+        self.global_sc_attn = nn.MultiheadAttention(self.dim_embed * 2, self.num_head)
+        self.layer_norm = nn.LayerNorm(self.dim_embed * 2)
+#         self.drop_out = nn.Dropout(self.drop_out_rate)
         
         # trajectory modeling
         self.traj_mod_gru = nn.GRUCell(self.dim_embed * 2, self.dim_embed * 2)
         
         # prediction head
         self.pred_head = nn.Sequential(
-            nn.Linear(self.dim_embed * 2, 1),
-            nn.Sigmoid()
+            nn.Linear(self.dim_embed * 4, self.dim_embed * 4),
+            nn.ReLU(),
+            nn.Linear(self.dim_embed * 4, 1),
+#             nn.Sigmoid()
             )
 
-    def forward(self, x):
+    def forward(self, x, cond):
         # location embedding 2->32
         embed_x = self.location_embedding(x).float()
         
@@ -298,13 +282,114 @@ class TrajDiscriminator(nn.Module):
         for curr in range(x.shape[1]):
             embed_t = self.time_embedding(torch.as_tensor(curr).to('cuda')) * torch.ones((embed_x.shape[0],1)).to('cuda')
             embed_p = torch.cat([embed_x[:,curr,:], embed_t], dim = 1)
-#             embed_p = self.fusion_layer(embed_p)
+            embed_p = self.batch_norm(embed_p)
+
+            # global spatial context attention for current-step trajectory points
+            curr_attn_output, _ = self.global_sc_attn(embed_p, embed_p, embed_p)
+#             curr_attn_output = self.drop_out(curr_attn_output)
+            curr_state = self.layer_norm(embed_p + curr_attn_output)
             
             # trajectory modeling
-            logits = self.traj_mod_gru(embed_p, logits)
+            logits = self.traj_mod_gru(curr_state, logits)
         
-        return self.pred_head(logits).flatten()
+        cond_embed = self.condition_embedding(cond)
+        
+        cond_logits = torch.cat([cond_embed, logits.mean(0).reshape(1,-1)], 1)
+        
+        return self.pred_head(cond_logits).reshape(1,-1)
     
+
+class BasicBlock(nn.Module):
+    """Basic Block for resnet 18 and resnet 34
+    """
+
+    #BasicBlock and BottleNeck block
+    #have different output size
+    #we use class attribute expansion
+    #to distinct
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+
+        #residual function
+        self.residual_function = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels * BasicBlock.expansion, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels * BasicBlock.expansion)
+        )
+
+        #shortcut
+        self.shortcut = nn.Sequential()
+
+        #the shortcut output dimension is not the same with residual function
+        #use 1*1 convolution to match the dimension
+        if stride != 1 or in_channels != BasicBlock.expansion * out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels * BasicBlock.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * BasicBlock.expansion)
+            )
+
+    def forward(self, x):
+        return nn.ReLU(inplace=True)(self.residual_function(x) + self.shortcut(x))
+
+    
+class ResNet(nn.Module):
+
+    def __init__(self, block, num_block):
+        super().__init__()
+
+        self.in_channels = 32
+
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(24, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True))
+        #we use a different inputsize than the original paper
+        #so conv2_x's stride is 1
+        self.conv2_x = self._make_layer(block, 48, num_block[0], 2)
+        self.conv3_x = self._make_layer(block, 64, num_block[1], 2)
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def _make_layer(self, block, out_channels, num_blocks, stride):
+        """make resnet layers(by layer i didnt mean this 'layer' was the
+        same as a neuron netowork layer, ex. conv layer), one layer may
+        contain more than one residual block
+        Args:
+            block: block type, basic block or bottle neck block
+            out_channels: output depth channel number of this layer
+            num_blocks: how many blocks per layer
+            stride: the stride of the first block of this layer
+        Return:
+            return a resnet layer
+        """
+
+        # we have num_block blocks per layer, the first block
+        # could be 1 or 2, other blocks would always be 1
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_channels, out_channels, stride))
+            self.in_channels = out_channels * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        output = self.conv1(x)
+        output = self.conv2_x(output)
+        output = self.conv3_x(output)
+        output = self.avg_pool(output)
+        output = output.view(output.size(0), -1)
+
+        return output
+    
+def resnet_mini():
+    """ return a mini ResNet object
+    """
+    return ResNet(BasicBlock, [2, 2])
+
     
 def seed_everything(seed):
     random.seed(seed)
@@ -315,24 +400,25 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     
-    
+        
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--img_path", type=str, default="../encoded_img_24")
     parser.add_argument("--traj_path", type=str, default="../encoded_traj_24")
-    parser.add_argument("--save_path", type=str, default="../weights_exp/weights_weighted_loss")
+    parser.add_argument("--save_path", type=str, default="../weights_exp/wgan_fix_grad2")
     parser.add_argument("--manual_seed", type=int, default=2022)
-    parser.add_argument("--sample_size", type=int, default=128)
+    parser.add_argument("--sample_size", type=int, default=64)
     parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--num_heads", type=int, default=1)
+    parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--dim_embed", type=int, default=32)
     parser.add_argument("--dim_loc", type=int, default=2)
-    parser.add_argument("--lr_d", type=float, default=0.005)
-    parser.add_argument("--lr_g", type=float, default=0.005)
-    parser.add_argument("--drop_out_rate", type=float, default=0.5)
+    parser.add_argument("--lr_d", type=float, default=0.0002)
+    parser.add_argument("--lr_g", type=float, default=0.0002)
+    parser.add_argument("--drop_out_rate", type=float, default=0.2)
     parser.add_argument("--test_rate", type=float, default=0.2)
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--resume", type=int, default=-1)
     args = parser.parse_args()
     
     if not os.path.isdir(args.save_path):
@@ -358,24 +444,24 @@ if __name__ == '__main__':
     train_loader = DataLoader(dataset = train_data, batch_size=1, shuffle=False)
     valid_loader = DataLoader(dataset = valid_data, batch_size=1, shuffle=False)
     
-    # Create the Trajectory Genaerator
-    traj_generator = TrajGenerator(num_traj=args.sample_size,
-                                   dim_loc=args.dim_loc,
-                                   dim_embed=args.dim_embed,
-                                   num_head=args.num_heads,
-                                   drop_out_rate=args.drop_out_rate).to(args.device)
-    
-    # Create the Trajectory Generator
-    traj_discriminator = TrajDiscriminator(num_traj=args.sample_size,
-                                           dim_loc=args.dim_loc,
-                                           dim_embed=args.dim_embed).to(args.device)
-    
-    # Initialize BCELoss function
-    criterion = nn.BCELoss()
+    # Create the Trajectory Generator and Discriminator
+    if args.resume < 0:
+        traj_generator = TrajGenerator(num_traj=args.sample_size,
+                                       dim_loc=args.dim_loc,
+                                       dim_embed=args.dim_embed,
+                                       num_head=args.num_heads,
+                                       drop_out_rate=args.drop_out_rate).to(args.device)
+        traj_discriminator = TrajDiscriminator(num_traj=args.sample_size,
+                                               dim_loc=args.dim_loc,
+                                               dim_embed=args.dim_embed).to(args.device)
+    else:
+        traj_generator = torch.load(f'{args.save_path}/G_epoch_{args.resume}.pth')
+        traj_discriminator = torch.load(f'{args.save_path}/D_epoch_{args.resume}.pth')
+        
 
     # Setup Adam optimizers for both G and D
-    optimizerDiscriminator = optim.Adam(traj_discriminator.parameters(), lr=args.lr_d, betas=(args.beta1, 0.999))
-    optimizerGenerator = optim.Adam(traj_generator.parameters(), lr=args.lr_g, betas=(args.beta1, 0.999))
+    optimizerDiscriminator = optim.RMSprop(traj_discriminator.parameters(), lr=args.lr_d, eps=1e-5)
+    optimizerGenerator = optim.RMSprop(traj_generator.parameters(), lr=args.lr_g, eps=1e-5)
     
     # Training Loop
     iters = 0
@@ -383,79 +469,72 @@ if __name__ == '__main__':
     logger.info("Starting Training Loop...")
     
     # For each epoch
-    for epoch in range(args.num_epochs):
+    for epoch in range(args.resume+1, args.num_epochs):
         # For each batch in the dataloader
         for i, data in enumerate(train_loader):
+            for _ in range(1):
+                """ Dicriminator forward-loss-backward-update """
+                ############################
+                # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
+                ###########################
+                ## Train with all-real batch
+                #traj_discriminator.zero_grad()
+                optimizerDiscriminator.zero_grad()
+                
+                # Format batch
+                sampled_points = data[0].to(args.device)[0].float()
+                real_points = data[1].to(args.device)[0].float()
+                cond = data[2].to(args.device).float()
 
-            ############################
-            # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-            ###########################
-            ## Train with all-real batch
-            traj_discriminator.zero_grad()
-            # Format batch
-            sampled_points = data[0].to(args.device)[0].float()
-            real_points = data[1].to(args.device)[0].float()
+                # Forward pass real batch through D
+                output_real = traj_discriminator(real_points.detach(), cond.detach())
+                D_x = output_real.mean().item()
+                
+                # generate synthetic trajs
+                fake_trajs, matching_cost = traj_generator(sampled_points)
+                
+                # Classify all fake batch with D
+                output_fake = traj_discriminator(fake_trajs.detach(), cond.detach())
+                D_G_z1 = output_fake.mean().item()
+                
+                # loss, which is also negative W-dist
+                errD = torch.mean(output_fake) - torch.mean(output_real)
+                errD.backward()
 
-            real_sample_size = real_points.shape[0]
-            real_labels = torch.full((real_sample_size,), 1., dtype=torch.float, device=args.device)
-
-            # Forward pass real batch through D
-            output = traj_discriminator(real_points)
-            # Calculate loss on all-real batch
-            errD_real = criterion(output, real_labels)
-            # Calculate gradients for D in backward pass
-            errD_real.backward()
-            D_x = output.mean().item()
-
-            ## Train with all-fake batch
-            # Generate fake image batch with G
-
-            fake_sample_size = sampled_points.shape[1]
-            fake_labels = torch.full((fake_sample_size,), 0., dtype=torch.float, device=args.device)
-
-            fake_trajs, matching_cost = traj_generator(sampled_points)
-
-            # Classify all fake batch with D
-            output = traj_discriminator(fake_trajs.detach())
-            # Calculate D's loss on the all-fake batch
-            errD_fake = criterion(output, fake_labels)
-            # Calculate the gradients for this batch, accumulated (summed) with previous gradients
-            errD_fake.backward()
-            D_G_z1 = output.mean().item()
-            # Compute error of D as sum over the fake and the real batches
-            errD = errD_real + errD_fake
-            # Update D
-            optimizerDiscriminator.step()
+                # Update D
+                optimizerDiscriminator.step()
+                for p in traj_discriminator.parameters():
+                    p.data.clamp_(-0.1, 0.1)
 
             ############################
             # (2) Update G network: maximize log(D(G(z)))
             ###########################
-            traj_generator.zero_grad()
-            real_labels = torch.full((fake_sample_size,), 1.0, dtype=torch.float, device=args.device)  # fake labels are real for generator cost
+            # traj_generator.zero_grad()
+            optimizerGenerator.zero_grad()
+            
+            # use fake_trajs in forward pass and update the gradients from non-differentiable loss via matching cost in backward pass
+            fake_trajs_diff = matching_cost + (fake_trajs - matching_cost).detach()
+            
             # Since we just updated D, perform another forward pass of all-fake batch through D
-            output = traj_discriminator(fake_trajs)
+            output_fake = traj_discriminator(fake_trajs_diff, cond)
+            D_G_z2 = output_fake.mean().item()
+            
             # Calculate G's loss based on this output
-            errG = criterion(output, real_labels)
+            errG = -torch.mean(output_fake)
             
-            with torch.no_grad():
-                matching_cost *= 0.1
-                matching_cost += errG
-            
-#           # Calculate gradients for G
-            # errG.backward()
-            matching_cost.backward()
-        
-            D_G_z2 = output.mean().item()
-#             # Update G
+            # Calculate gradients for G
+            errG.backward()
+    
+            # Update G
             optimizerGenerator.step()
 
             # Output training stats
             if i % 50 == 0:
                 logger.info('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f'
                       % (epoch, args.num_epochs - 1, i, len(train_loader),
-                         errD.item(), matching_cost.item(), D_x, D_G_z1, D_G_z2))
+                         errD.item(), errG.item(), D_x, D_G_z1, D_G_z2))
 
-            logger.update_loss(f'{epoch},{iters},{errD.item()},{matching_cost.item()},{D_x},{D_G_z1},{D_G_z2}\n')
+            logger.update_loss(f'{epoch},{iters},{errD.item()},{errG.item()},{D_x},{D_G_z1},{D_G_z2}\n')
             iters += 1
             
         torch.save(traj_generator, f'{args.save_path}/G_epoch_{epoch}.pth')
