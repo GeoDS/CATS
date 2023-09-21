@@ -68,7 +68,9 @@ Due to the non-disclosure agreement with the data provider and privacy concerns,
 
 ```
 📁./images
-└── framework.jpg:: the diagram of CATS framework.
+├── framework.jpg:: the diagram of CATS framework.
+├── overall_distribution.png:: the overall distribution of processed individual GPS trajectory  data.
+└── visual_example.jpg:: a visual example of human mobility aggregation.
 ```
 
 ```
