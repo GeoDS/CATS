@@ -13,7 +13,7 @@ The prevalence of ubiquitous location-aware devices and mobile Internet enables 
 ## Reference
 If you find our code or ideas useful for your research, please cite our paper:
 
-Rao, J., Gao, S., Zhu, S. (2023). CATS: Conditional Adversarial Trajectory Synthesis for Privacy-Preserving Trajectory Data Publication Using Deep Learning Approaches. International Journal of Geographical Information Science. DOI: 10.1080/13658816.2023.2262550
+Rao, J., Gao, S., Zhu, S. (2023). [CATS: Conditional Adversarial Trajectory Synthesis for Privacy-Preserving Trajectory Data Publication Using Deep Learning Approaches](https://www.tandfonline.com/eprint/FJNDWSJUAJ9MUYNNQWAF/full?target=10.1080/13658816.2023.2262550). International Journal of Geographical Information Science. DOI: 10.1080/13658816.2023.2262550
 
 
 ```
