@@ -132,7 +132,7 @@ Where `img_path` is the spatiotemporal mobility matrix npy files, `traj_path` is
 Run CATS to generate synthetic trajectory data conditional on spatiotemporal mobility matrices.
 
 ```
-python -m scripts.run_cats [--sstm_path] [--weight_path] [--save_path]
+python -m scripts.run_cats [--sstm_path] [--weight_path] [--save_path] [--epoch]
 ```
 
 Where `sstm_path` is the spatiotemporal mobility matrix npy files, `weight_path` is the path to saved model weights, `save_path` is the path to save synthetic trajectory data.
