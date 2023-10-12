@@ -125,7 +125,7 @@ Train CATS using the preprocessed data.
 python -m scripts.train_cats [--img_path] [--traj_path] [--save_path]
 ```
 
-Where `img_path` is the spatiotemporal mobility matrix npy files, `traj_path` is the original individual GPS trajectory files, `save_path` is the path to save model weights. Note that currently  the original `img_path` and `traj_path` data are not released due to NDA and privacy concerns.
+Where `img_path` is the spatiotemporal mobility matrix npy files, `traj_path` is the original individual GPS trajectory files, `save_path` is the path to save model weights. Note that currently the original training data (i.e., `img_path` and `traj_path`) are not released due to NDA and privacy concerns.
 
 ### Inference
 
@@ -135,7 +135,7 @@ Run CATS to generate synthetic trajectory data conditional on spatiotemporal mob
 python -m scripts.run_cats [--sstm_path] [--weight_path] [--save_path] [--epoch]
 ```
 
-Where `sstm_path` is the spatiotemporal mobility matrix npy files, `weight_path` is the path to saved model weights, `save_path` is the path to save synthetic trajectory data.
+Where `sstm_path` is the spatiotemporal mobility matrix npy files, `weight_path` is the path to saved model weights, `save_path` is the path to save synthetic trajectory data, `epoch` is the epoch of the selected generator weight.
 
 
 ### Repository References
